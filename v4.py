@@ -12,6 +12,9 @@ import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import time
 import hashlib
+import numpy as np
+import cv2
+import dlib
 
 app = Flask(__name__)
 
@@ -20,11 +23,47 @@ PHOTOS_ROOT = r"C:\Users\User1\Desktop\face recognition - v3\static\photos"  # S
 RESULTS_FOLDER = os.path.join('static', 'results')
 os.makedirs(RESULTS_FOLDER, exist_ok=True)
 
-# Performance optimization: Database for face encodings cache
+# Face alignment setup
+face_detector = dlib.get_frontal_face_detector()
+predictor_model = dlib.shape_predictor(face_recognition.api.pose_predictor_model_location())
+
+def align_face(image):
+    """Align the largest face in the image and return aligned crop."""
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        rects = face_detector(gray, 1)
+
+        if len(rects) == 0:
+            return image  # fallback: no alignment
+
+        # Pick the largest detected face
+        rect = max(rects, key=lambda r: r.width() * r.height())
+
+        # Get landmarks
+        shape = predictor_model(gray, rect)
+        landmarks = [(shape.part(i).x, shape.part(i).y) for i in range(68)]
+
+        # Use eyes for alignment
+        left_eye = np.mean(landmarks[36:42], axis=0)
+        right_eye = np.mean(landmarks[42:48], axis=0)
+
+        dY = right_eye[1] - left_eye[1]
+        dX = right_eye[0] - left_eye[0]
+        angle = np.degrees(np.arctan2(dY, dX))
+        eyes_center = ((left_eye[0] + right_eye[0]) / 2, (left_eye[1] + right_eye[1]) / 2)
+
+        M = cv2.getRotationMatrix2D(eyes_center, angle, scale=1.0)
+        aligned = cv2.warpAffine(image, M, (image.shape[1], image.shape[0]), flags=cv2.INTER_CUBIC)
+
+        return aligned
+    except Exception as e:
+        print(f"⚠️ Face alignment failed: {e}")
+        return image  # fallback
+
+# Caching
 FACE_CACHE_DB = "face_cache.db"
 
 def setup_face_cache():
-    """Setup database for caching face encodings"""
     conn = sqlite3.connect(FACE_CACHE_DB)
     cursor = conn.cursor()
     cursor.execute('''
@@ -41,7 +80,6 @@ def setup_face_cache():
     conn.close()
 
 def get_file_hash(file_path):
-    """Get file hash for change detection"""
     try:
         stat = os.stat(file_path)
         return f"{stat.st_mtime}_{stat.st_size}"
@@ -49,20 +87,16 @@ def get_file_hash(file_path):
         return "unknown"
 
 def get_cached_face_encodings(image_path):
-    """Get cached face encodings if available and up-to-date"""
     try:
         conn = sqlite3.connect(FACE_CACHE_DB)
         cursor = conn.cursor()
-        
         current_hash = get_file_hash(image_path)
         cursor.execute('''
             SELECT face_encodings, original_name FROM face_cache 
             WHERE image_path = ? AND file_hash = ?
         ''', (image_path, current_hash))
-        
         result = cursor.fetchone()
         conn.close()
-        
         if result:
             return pickle.loads(result[0]), result[1]
         return None, None
@@ -70,59 +104,44 @@ def get_cached_face_encodings(image_path):
         return None, None
 
 def cache_face_encodings(image_path, face_encodings, original_name):
-    """Cache face encodings for future use"""
     try:
         conn = sqlite3.connect(FACE_CACHE_DB)
         cursor = conn.cursor()
-        
         file_hash = get_file_hash(image_path)
         encodings_blob = pickle.dumps(face_encodings)
-        
         cursor.execute('''
             INSERT OR REPLACE INTO face_cache 
             (image_path, face_encodings, file_hash, last_modified, original_name)
             VALUES (?, ?, ?, ?, ?)
         ''', (image_path, encodings_blob, file_hash, time.time(), original_name))
-        
         conn.commit()
         conn.close()
     except:
-        pass  # Don't fail if caching fails
+        pass
 
 def process_single_image(args):
-    """Process a single image (for parallel processing)"""
     img_path, query_encoding = args
-    
     try:
-        # Check cache first
         cached_encodings, original_name = get_cached_face_encodings(img_path)
-        
         if cached_encodings is None:
-            # Process image normally (your exact same logic)
             gallery_img = face_recognition.load_image_file(img_path)
+            gallery_img = align_face(gallery_img)
             cached_encodings = face_recognition.face_encodings(gallery_img)
-            
-            # Cache the results
             if cached_encodings:
                 original_name = os.path.splitext(os.path.basename(img_path))[0]
                 cache_face_encodings(img_path, cached_encodings, original_name)
-        
         if not cached_encodings:
             return None
-        
-        # Find best match (your exact same logic)
         best_distance = float('inf')
         for face_encoding in cached_encodings:
             dist = face_recognition.face_distance([query_encoding], face_encoding)[0]
             if dist < best_distance:
                 best_distance = dist
-        
         return {
             'path': img_path,
             'best_distance': best_distance,
             'original_name': original_name
         }
-        
     except Exception as e:
         print(f"Error processing {img_path}: {e}")
         return None
@@ -130,18 +149,15 @@ def process_single_image(args):
 def get_all_image_paths(folder):
     exts = ['.jpg', '.jpeg', '.png']
     img_files = []
-    seen_files = set()  # Track seen files to avoid duplicates
-    
+    seen_files = set()
     for root, _, files in os.walk(folder):
         for file in files:
             if any(file.lower().endswith(ext) for ext in exts):
                 full_path = os.path.join(root, file)
-                # Use normalized path to avoid duplicates
                 normalized_path = os.path.normpath(full_path)
                 if normalized_path not in seen_files:
                     seen_files.add(normalized_path)
                     img_files.append(normalized_path)
-    
     print(f"🔍 Found {len(img_files)} unique images (filtered duplicates)")
     return img_files
 
@@ -155,9 +171,9 @@ def clear_results_folder():
             pass
 
 def process_search(search_file):
-    # Read uploaded image from memory
     image_bytes = search_file.read()
     query_img = face_recognition.load_image_file(BytesIO(image_bytes))
+    query_img = align_face(query_img)
     query_encodings = face_recognition.face_encodings(query_img)
     if not query_encodings:
         return [], []
@@ -165,60 +181,50 @@ def process_search(search_file):
 
     strong_matches = []
     doubtful_matches = []
-    
+
     print(f"🚀 Starting HIGH-PERFORMANCE face search...")
-    
-    # Get all image paths
+
     all_image_paths = get_all_image_paths(PHOTOS_ROOT)
     total_images = len(all_image_paths)
     print(f"📸 Processing {total_images} images with parallel optimization...")
-    
-    # Prepare arguments for parallel processing
+
     args_list = [(img_path, query_encoding) for img_path in all_image_paths]
-    
-    # Use parallel processing for massive speed improvement
-    max_workers = min(multiprocessing.cpu_count(), 8)  # Don't overload system
+
+    max_workers = min(multiprocessing.cpu_count(), 8)
     print(f"⚡ Using {max_workers} parallel workers...")
-    
+
     start_time = time.time()
-    
-    # Process images in parallel
+
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         results = list(executor.map(process_single_image, args_list))
-    
+
     processing_time = time.time() - start_time
     print(f"⚡ Parallel processing completed in {processing_time:.2f} seconds!")
-    
-    # Process results (your exact same logic)
-    processed_original_names = set()  # Track processed original names to prevent duplicates
-    
+
+    processed_original_names = set()
+
     for result in results:
         if result is None:
             continue
-            
+
         img_path = result['path']
         best_distance = result['best_distance']
         original_name = result['original_name']
-        
-        # Skip if we've already processed this original image name
+
         if original_name in processed_original_names:
             print(f"⚠️  Skipping duplicate original name: {original_name} (from {img_path})")
             continue
-            
+
         processed_original_names.add(original_name)
         print(f"Processed: {img_path} (distance: {best_distance:.3f})")
-        
-        # Create a unique result filename that preserves original name
-        unique_id = str(uuid.uuid4())[:8]  # Use shorter UUID
+
+        unique_id = str(uuid.uuid4())[:8]
         result_filename = f"{unique_id}_{os.path.basename(img_path)}"
         result_path = os.path.join(RESULTS_FOLDER, result_filename)
-        
-        # Copy the image to results folder
         shutil.copy2(img_path, result_path)
-        
-        # Categorize based on best distance found - each image goes to ONLY ONE category
+
         print(f"  📊 Categorizing {original_name}: distance={best_distance:.3f}")
-        
+
         if best_distance <= 0.35:
             strong_matches.append({
                 "path": "results/" + result_filename,
@@ -238,36 +244,29 @@ def process_search(search_file):
 
     print(f"Search complete. Strong matches: {len(strong_matches)}, Doubtful matches: {len(doubtful_matches)}")
     print(f"⚡ Performance: {total_images} images processed in {processing_time:.2f}s = {total_images/processing_time:.1f} images/second")
-    
-    # Final verification: ensure no duplicates exist
+
     strong_original_names = set()
     doubtful_original_names = set()
-    
+
     print("\n=== DETAILED VERIFICATION ===")
     print("Strong matches:")
     for match in strong_matches:
         print(f"  - {match['path']} (original: {match['original_name']}, distance: {match['distance']:.3f})")
-        if match["original_name"] in strong_original_names:
-            print(f"    🚨 WARNING: Duplicate original name found in strong matches: {match['original_name']}")
         strong_original_names.add(match["original_name"])
-    
+
     print("\nDoubtful matches:")
     for match in doubtful_matches:
         print(f"  - {match['path']} (original: {match['original_name']}, distance: {match['distance']:.3f})")
-        if match["original_name"] in doubtful_original_names:
-            print(f"    🚨 WARNING: Duplicate original name found in doubtful matches: {match['original_name']}")
         doubtful_original_names.add(match["original_name"])
-    
-    # Check for cross-duplicates between strong and doubtful
+
     cross_duplicates = strong_original_names.intersection(doubtful_original_names)
     if cross_duplicates:
         print(f"\n🚨 CRITICAL ERROR: Cross-duplicates found between strong and doubtful: {cross_duplicates}")
-        print("This should NEVER happen with the new logic!")
     else:
         print(f"\n✅ SUCCESS: No cross-duplicates found")
-    
+
     print(f"\nVerification complete. Total unique images: {len(strong_original_names) + len(doubtful_original_names)}")
-    
+
     return strong_matches, doubtful_matches
 
 @app.route('/', methods=['GET', 'POST'])
@@ -284,8 +283,7 @@ def index():
     return render_template('index.html', strong_images=strong, doubtful_images=doubtful)
 
 if __name__ == '__main__':
-    # Initialize face cache database
     setup_face_cache()
     print("🚀 High-Performance Face Recognition System Ready!")
-    print("⚡ Features: Parallel Processing + Smart Caching + Zero Quality Loss")
+    print("⚡ Features: Parallel Processing + Smart Caching + Face Alignment + Zero Quality Loss")
     app.run(debug=True)
